@@ -25,6 +25,9 @@ import cv2
 import json
 import pathlib
 import argparse
+import tkinter as tk
+from tkinter import filedialog
+import numpy as np
 
 # Appearance constants
 NODE_RADIUS  = 8
@@ -47,6 +50,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    root = tk.Tk()
+    root.withdraw()    # keep the main Tk window hidden
     img_path  = pathlib.Path(args.image)
     json_path = pathlib.Path(args.json)
     scale     = args.scale
@@ -183,18 +188,41 @@ def main():
         elif k==ord('b'): mode='branch'; tag_target=None
         elif k==ord('e'): mode,edge_sel='edge',[]; tag_target=None
         elif k==ord('t'): mode,edge_sel='tag',[]; tag_target=None
+        elif k == ord('u'):
+            # Open a file dialog to pick an image
+            path = filedialog.askopenfilename(
+                title="Select background image for floor %d" % current_floor,
+                filetypes=[("Image files", "*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff")]
+            )
+            if path:
+                img = cv2.imread(path, cv2.IMREAD_COLOR)
+                if img is None:
+                    print(f"Error: could not load image {path}")
+                else:
+                    h, w = img.shape[:2]
+                    images_by_floor[current_floor] = {
+                        "orig": img,
+                        "scale": init_scale,
+                        "w": w,
+                        "h": h,
+                        "disp": None,
+                        "dx": 0,
+                        "dy": 0,
+                    }
+                    print(f"Loaded image for floor {current_floor}: {path}")
+                    redraw()
         elif k in (ord('1'),ord('2'),ord('3')) and mode=='tag' and tag_target:
-            n = next((x for x in data['nodes'] if x['id']==tag_target), None)
-            if n:
-                key = {'1':'hallway','2':'elevator','3':'full'}[chr(k)]
-                tags=n.setdefault('tags',{'hallway':False,'elevator':False,'full':False})
-                tags[key] = not tags[key]
-                print(f"Toggled {key} on {tag_target} → {tags[key]}")
-        elif k==ord('s'):
-            pathlib.Path(json_path).write_text(json.dumps(data,indent=2))
-            print(f"Saved {json_path}")
-        redraw()
-    cv2.destroyAllWindows()
+                n = next((x for x in data['nodes'] if x['id']==tag_target), None)
+                if n:
+                    key = {'1':'hallway','2':'elevator','3':'full'}[chr(k)]
+                    tags=n.setdefault('tags',{'hallway':False,'elevator':False,'full':False})
+                    tags[key] = not tags[key]
+                    print(f"Toggled {key} on {tag_target} → {tags[key]}")
+                elif k==ord('s'):
+                    pathlib.Path(json_path).write_text(json.dumps(data,indent=2))
+                    print(f"Saved {json_path}")
+                    redraw()
+                cv2.destroyAllWindows()
 
 if __name__=='__main__':
     main()

@@ -26,7 +26,7 @@ from matplotlib.widgets import Slider, RadioButtons, CheckButtons, Button, TextB
 
 def load_floor_files(directory):
     floors = {}
-    pattern = os.path.join(directory, 'floor*.json')
+    pattern = os.path.join(directory, 'floor*_aligned_aligned_aligned.json')
     for path in sorted(glob.glob(pattern)):
         file_id = os.path.splitext(os.path.basename(path))[0]
         with open(path) as f:

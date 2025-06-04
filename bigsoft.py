@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+"""
+floorplan_editor.py — interactive multi-floor floorplan node/edge editor
+
+Features:
+  • Multi-floor support: switch floors with [ / ]
+  • Per-floor background images: press u to upload for current floor
+  • Scaling of each floor’s image with + / –
+  • Modes: normal, hallway, branch, edge, tag, save, quit
+  • Tag mode: 1=hallway,2=elevator,3=full; A–Z=wing; 1=N,2=L,3=B,4=M=binType
+  • Auto-chaining of hallway nodes; branch-mode auto-links to nearest hallway
+  • Zoom applies only to the background; node coords remain in “world” space
+  • Save/load JSON with per-node attrs: id, x, y, floor, tags, wing, binType
+  • Edges survive save/load; each edge includes its floor
+Controls:
+  n: normal (create node at click)
+  h: hallway (auto-chain)
+  c: continue-hallway (alias for h)
+  b: branch (auto-link to nearest hallway)
+  e: edge (click two nodes)
+  t: tag mode (click node, then press 1/2/3 for tags, A–Z for wing, 1–4 for binType)
+  [: switch to previous floor
+  ]: switch to next floor
+  +: increase current floor’s image scale
+  -: decrease current floor’s image scale
+  u: upload image for current floor
+  s: save JSON
+  q: quit
+"""
+
+import cv2
+import json
+import pathlib
+import argparse
+import numpy as np
+import tkinter as tk
+from tkinter import filedialog
+
+# -------------- Appearance constants --------------
+NODE_RADIUS  = 8
+CLICK_THRESH = 15
+EDGE_COLOR   = (50, 150, 255)
+EDGE_THICK   = 3
+
+# Colors for node fill + outlines
+NODE_FILL    = (0, 255, 255)
+NODE_OUTLINE = (0,   0,   0)
+SEL_OUTLINE  = (0,   0, 255)
+
+# Colors for text labels
+TAG_COLOR    = (0,   0, 255)   # for hallway/elevator/full badge
+WING_COLOR   = (0, 255,   0)   # for wing label
+BIN_COLOR    = (255, 0,   0)   # for binType label
+# -------------------------------------------------
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Interactive multi-floor floorplan editor")
+    p.add_argument(
+        "--image",
+        action="append",
+        default=[],
+        help="specify floor:image_path, e.g. 0:floor0.png; can repeat for each floor",
+    )
+    p.add_argument(
+        "--json",
+        required=True,
+        help="path to nodes/edges JSON file (will be loaded/saved)",
+    )
+    p.add_argument(
+        "--scale",
+        type=float,
+        default=1.0,
+        help="initial UI zoom factor for background images",
+    )
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    json_path = pathlib.Path(args.json)
+    init_scale = args.scale
+
+    # Initialize Tk so we can use filedialog later
+    root = tk.Tk()
+    root.withdraw()
+
+    # 1. Build images_by_floor from --image flags
+    #    Each entry: { orig, scale, w, h, dx, dy, disp }
+    images_by_floor: dict[int, dict] = {}
+    for spec in args.image:
+        try:
+            floor_str, img_path = spec.split(":", 1)
+            fl = int(floor_str)
+            img = cv2.imread(img_path, cv2.IMREAD_COLOR)
+            if img is None:
+                print(f"Warning: could not load image at {img_path} for floor {fl}")
+                continue
+            h, w = img.shape[:2]
+            images_by_floor[fl] = {
+                "orig": img,
+                "scale": init_scale,
+                "w": w,
+                "h": h,
+                "disp": None,  # to be computed
+                "dx": 0,       # pan offset X
+                "dy": 0,       # pan offset Y
+            }
+        except Exception as e:
+            print(f"Invalid --image spec '{spec}': {e}")
+
+    # 2. Load or initialize JSON data structure
+    if json_path.exists():
+        try:
+            data = json.loads(json_path.read_text())
+        except Exception as e:
+            print(f"Error reading JSON file: {e}")
+            return
+    else:
+        data = {"nodes": [], "edges": []}
+
+    data.setdefault("nodes", [])
+    data.setdefault("edges", [])
+
+    # 3. Track current floor and UI state
+    current_floor = 0
+    mode = "normal"           # normal/hallway/branch/edge/tag
+    edge_sel: list[str] = []  # for edge-mode
+    last_hallway: str | None = None
+    tag_target: str | None = None
+
+    # ----------------------------------------------------
+    # Helper functions: scale & pan background, nearest node
+    # ----------------------------------------------------
+    def get_scaled_display_img(floor: int):
+        """
+        Return a pan+scaled copy of floor’s background image, or None if absent.
+        """
+        info = images_by_floor.get(floor)
+        if not info:
+            return None
+        orig = info["orig"]
+        s = info["scale"]
+        h, w = info["h"], info["w"]
+        # Resize (scale)
+        disp = cv2.resize(orig, (int(w * s), int(h * s)), interpolation=cv2.INTER_LINEAR)
+        # Pan offsets
+        dx, dy = int(info["dx"]), int(info["dy"])
+        # Add border so we can pan into negative
+        canvas = cv2.copyMakeBorder(
+            disp,
+            top=max(0, dy),
+            bottom=max(0, -dy),
+            left=max(0, dx),
+            right=max(0, -dx),
+            borderType=cv2.BORDER_CONSTANT,
+            value=(200, 200, 200),
+        )
+        # Crop back to exactly the scaled size
+        h2, w2 = canvas.shape[:2]
+        x0 = max(0, -dx)
+        y0 = max(0, -dy)
+        canvas = canvas[y0 : y0 + int(h * s), x0 : x0 + int(w * s)]
+        info["disp"] = canvas
+        return canvas
+
+    def nodes_on_floor():
+        return [n for n in data["nodes"] if n.get("floor", 0) == current_floor]
+
+    def edges_on_floor():
+        # Build a lookup from node ID → node object
+        node_by_id = {n["id"]: n for n in data["nodes"]}
+
+        valid = []
+        for e in data["edges"]:
+            u, v = e[0], e[1]
+            nu = node_by_id.get(u)
+            nv = node_by_id.get(v)
+            # include the edge only if both endpoints live on the current floor
+            if nu is not None and nv is not None:
+                if nu.get("floor", 0) == current_floor and nv.get("floor", 0) == current_floor:
+                    valid.append((u, v))
+        return valid
+
+
+    def id2pt_scaled():
+        """
+        Map each node ID → its (x*scale + dx, y*scale + dy) on the display.
+        """
+        pts = {}
+        info = images_by_floor.get(current_floor)
+        s = info["scale"] if info else init_scale
+        dx = info["dx"] if info else 0
+        dy = info["dy"] if info else 0
+        for n in nodes_on_floor():
+            xw, yw = n["x"], n["y"]
+            xd = int(xw * s + dx)
+            yd = int(yw * s + dy)
+            pts[n["id"]] = (xd, yd)
+        return pts
+
+    def nearest_node(pt_disp):
+        """
+        Return the nearest node on this floor within CLICK_THRESH of pt_disp.
+        """
+        pts = id2pt_scaled()
+        for n in nodes_on_floor():
+            x_disp, y_disp = pts[n["id"]]
+            dx = x_disp - pt_disp[0]
+            dy = y_disp - pt_disp[1]
+            if dx * dx + dy * dy <= CLICK_THRESH * CLICK_THRESH:
+                return n
+        return None
+
+    def nearest_hallway_node(pt_disp):
+        """
+        Among nodes on this floor with tags['hallway']==True, return the one
+        closest to pt_disp (in display coords).
+        """
+        pts = id2pt_scaled()
+        best, bd = None, float("inf")
+        for n in nodes_on_floor():
+            if n.get("tags", {}).get("hallway"):
+                x0, y0 = pts[n["id"]]
+                d = (x0 - pt_disp[0]) ** 2 + (y0 - pt_disp[1]) ** 2
+                if d < bd:
+                    best, bd = n, d
+        return best
+
+    # -----------------
+    # Redraw everything
+    # -----------------
+    canvas = None
+
+    def redraw():
+        nonlocal canvas
+        disp_bg = get_scaled_display_img(current_floor)
+        if disp_bg is None:
+            # Draw a blank gray canvas if no image for this floor
+            h, w = 600, 800
+            canvas = 50 * np.ones((h, w, 3), dtype=np.uint8)
+        else:
+            canvas = disp_bg.copy()
+
+        pts = id2pt_scaled()
+        # Draw edges for this floor
+        for u, v in edges_on_floor():
+            if u in pts and v in pts:
+                cv2.line(canvas, pts[u], pts[v], EDGE_COLOR, EDGE_THICK)
+
+        # Draw nodes for this floor
+        for n in nodes_on_floor():
+            x_disp, y_disp = pts[n["id"]]
+            # fill circle
+            cv2.circle(canvas, (x_disp, y_disp), NODE_RADIUS, NODE_FILL, -1)
+            # outline
+            cv2.circle(canvas, (x_disp, y_disp), NODE_RADIUS, NODE_OUTLINE, 1)
+            # highlight in edge mode
+            if mode == "edge" and n["id"] in edge_sel:
+                cv2.circle(canvas, (x_disp, y_disp), NODE_RADIUS + 4, SEL_OUTLINE, 2)
+            # highlight in tag mode
+            if mode == "tag" and n["id"] == tag_target:
+                cv2.circle(canvas, (x_disp, y_disp), NODE_RADIUS + 6, SEL_OUTLINE, 2)
+
+            # Tag badges: H/E/F
+            tags = n.get("tags", {})
+            badge = ""
+            if tags.get("hallway"):
+                badge = "H"
+            elif tags.get("elevator"):
+                badge = "E"
+            elif tags.get("full"):
+                badge = "F"
+            if badge:
+                cv2.putText(
+                    canvas,
+                    badge,
+                    (x_disp + NODE_RADIUS + 2, y_disp - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    TAG_COLOR,
+                    1,
+                )
+
+            # Wing label above node
+            wing = n.get("wing")
+            if wing:
+                cv2.putText(
+                    canvas,
+                    wing.upper(),
+                    (x_disp - 8, y_disp - NODE_RADIUS - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    WING_COLOR,
+                    1,
+                )
+
+            # BinType label below node
+            binType = n.get("binType", "N")
+            if binType:
+                cv2.putText(
+                    canvas,
+                    binType,
+                    (x_disp - 6, y_disp + NODE_RADIUS + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    BIN_COLOR,
+                    1,
+                )
+
+        # Draw current floor indicator
+        cv2.putText(
+            canvas,
+            f"Floor: {current_floor}",
+            (10, 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+        )
+
+    # ---------------------
+    # Mouse callback (click)
+    # ---------------------
+    def on_click(event, x_disp, y_disp, flags, param):
+        nonlocal last_hallway, tag_target
+        # Map display coords → world coords:
+        info = images_by_floor.get(current_floor)
+        s = info["scale"] if info else init_scale
+        dx = info["dx"] if info else 0
+        dy = info["dy"] if info else 0
+        ox = (x_disp - dx) / s
+        oy = (y_disp - dy) / s
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            if mode == "normal":
+                nid = f"N{len(data['nodes'])}_{int(ox)}_{int(oy)}"
+                data["nodes"].append(
+                    {
+                        "id": nid,
+                        "x": ox,
+                        "y": oy,
+                        "floor": current_floor,
+                        "tags": {"hallway": False, "elevator": False, "full": False},
+                        "wing": None,
+                        "binType": "N",
+                    }
+                )
+                tag_target = None
+
+            elif mode == "hallway":
+                nid = f"N{len(data['nodes'])}_{int(ox)}_{int(oy)}"
+                data["nodes"].append(
+                    {
+                        "id": nid,
+                        "x": ox,
+                        "y": oy,
+                        "floor": current_floor,
+                        "tags": {"hallway": True, "elevator": False, "full": False},
+                        "wing": None,
+                        "binType": "N",
+                    }
+                )
+                if last_hallway and last_hallway != nid:
+                    data["edges"].append([last_hallway, nid, current_floor])
+                last_hallway = nid
+                tag_target = None
+
+            elif mode == "branch":
+                nid = f"N{len(data['nodes'])}_{int(ox)}_{int(oy)}"
+                data["nodes"].append(
+                    {
+                        "id": nid,
+                        "x": ox,
+                        "y": oy,
+                        "floor": current_floor,
+                        "tags": {"hallway": False, "elevator": False, "full": False},
+                        "wing": None,
+                        "binType": "N",
+                    }
+                )
+                h = nearest_hallway_node((x_disp, y_disp))
+                if h:
+                    data["edges"].append([nid, h["id"], current_floor])
+                tag_target = None
+
+            elif mode == "edge":
+                n = nearest_node((x_disp, y_disp))
+                if n and n["id"] not in edge_sel:
+                    edge_sel.append(n["id"])
+                    if len(edge_sel) == 2:
+                        data["edges"].append([edge_sel[0], edge_sel[1], current_floor])
+                        edge_sel.clear()
+                tag_target = None
+
+            elif mode == "tag":
+                n = nearest_node((x_disp, y_disp))
+                tag_target = n["id"] if n else None
+
+            redraw()
+
+        elif event == cv2.EVENT_RBUTTONDOWN and mode in ("normal", "hallway", "branch"):
+            n = nearest_node((x_disp, y_disp))
+            if n:
+                data["nodes"].remove(n)
+                # Remove edges on this floor involving n
+                data["edges"] = [
+                    (u, v)
+                    for (u, v) in data["edges"]
+                    if not (fl == current_floor and (u == n["id"] or v == n["id"]))
+                ]
+                if mode == "hallway" and n["id"] == last_hallway:
+                    last_hallway = None
+                if mode == "tag" and n["id"] == tag_target:
+                    tag_target = None
+                redraw()
+
+    # ----------------------
+    # Set up OpenCV window
+    # ----------------------
+    cv2.namedWindow("editor", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+    cv2.setMouseCallback("editor", on_click)
+    redraw()
+
+    print(
+        "Modes: n normal | h hallway | c continue | b branch | e edge | t tag | s save | q quit"
+    )
+    print(
+        "In tag mode: click a node, then press 1=hallway,2=elevator,3=full, A–Z=wing, 1–4=binType"
+    )
+    print("Switch floors: [ / ]   |   Zoom image: + / -   |   Upload image: u")
+
+    while True:
+        cv2.imshow("editor", canvas)
+        k = cv2.waitKey(20) & 0xFF
+
+        if k == ord("q"):
+            break
+
+        # Mode switches
+        elif k == ord("n"):
+            mode = "normal"
+            edge_sel.clear()
+            last_hallway = None
+            tag_target = None
+
+        elif k in (ord("h"), ord("c")):
+            mode = "hallway"
+            edge_sel.clear()
+            tag_target = None
+
+        elif k == ord("b"):
+            mode = "branch"
+            edge_sel.clear()
+            tag_target = None
+
+        elif k == ord("e"):
+            mode = "edge"
+            edge_sel.clear()
+            tag_target = None
+
+        elif k == ord("t"):
+            mode = "tag"
+            edge_sel.clear()
+            tag_target = None
+
+        # Tag mode: toggle tags or set wing/binType
+        elif mode == "tag" and tag_target:
+            n = next((x for x in data["nodes"] if x["id"] == tag_target), None)
+            if n:
+                # Toggle hallway/elevator/full with 1/2/3
+                if k == ord("1"):
+                    tags = n.setdefault("tags", {"hallway": False, "elevator": False, "full": False})
+                    tags["hallway"] = not tags.get("hallway", False)
+                elif k == ord("2"):
+                    tags = n.setdefault("tags", {"hallway": False, "elevator": False, "full": False})
+                    tags["elevator"] = not tags.get("elevator", False)
+                elif k == ord("3"):
+                    tags = n.setdefault("tags", {"hallway": False, "elevator": False, "full": False})
+                    tags["full"] = not tags.get("full", False)
+                # Wing with letters A–Z
+                elif 65 <= k <= 90 or 97 <= k <= 122:
+                    ch = chr(k).upper()
+                    n["wing"] = ch
+                # BinType with 1–4: 1=N, 2=L, 3=B, 4=M
+                elif k == ord("1"):
+                    n["binType"] = "N"
+                elif k == ord("2"):
+                    n["binType"] = "L"
+                elif k == ord("3"):
+                    n["binType"] = "B"
+                elif k == ord("4"):
+                    n["binType"] = "M"
+                redraw()
+
+        # Save JSON
+        elif k == ord("s"):
+            # Convert edges to lists of [u,v,floor] if not already
+            data["edges"] = [[u, v] for (u, v) in data["edges"]]
+            json_path.write_text(json.dumps(data, indent=2))
+            print(f"Saved {json_path}")
+
+        # Upload image for current floor
+        elif k == ord("u"):
+            path = filedialog.askopenfilename(
+                title=f"Select image for floor {current_floor}",
+                filetypes=[("Image files", "*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff")],
+            )
+            if path:
+                img = cv2.imread(path, cv2.IMREAD_COLOR)
+                if img is None:
+                    print(f"Error: could not load image {path}")
+                else:
+                    h, w = img.shape[:2]
+                    images_by_floor[current_floor] = {
+                        "orig": img,
+                        "scale": init_scale,
+                        "w": w,
+                        "h": h,
+                        "disp": None,
+                        "dx": 0,
+                        "dy": 0,
+                    }
+                    print(f"Loaded image for floor {current_floor}: {path}")
+                    redraw()
+
+        # Switch floors
+        elif k == ord("["):
+            current_floor = max(0, current_floor - 1)
+            last_hallway = None
+            tag_target = None
+            redraw()
+        elif k == ord("]"):
+            current_floor += 1
+            last_hallway = None
+            tag_target = None
+            redraw()
+
+        # Zoom image for current floor
+        elif k == ord("+"):
+            info = images_by_floor.get(current_floor)
+            if info:
+                info["scale"] *= 1.1
+                redraw()
+        elif k == ord("-"):
+            info = images_by_floor.get(current_floor)
+            if info:
+                info["scale"] /= 1.1
+                redraw()
+
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
