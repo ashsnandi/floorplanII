@@ -81,7 +81,7 @@ def on_pick(event):
             print(f"Added edge: {edge}")
         selected.clear()
     redraw()
-
+x
 # Handle key presses
 def on_key(event):
     if event.key == 's':
